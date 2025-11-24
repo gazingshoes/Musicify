@@ -1,165 +1,152 @@
 """
 Audio Player Module (Pygame Version)
-This version uses pygame for playback and is integrated
-with PySide6 by using QObject and Signals.
-(FIXED to auto-play on add-to-queue if idle)
+Updated with Shuffle functionality.
 """
 
 import pygame
-import time
+import random
 from PySide6.QtCore import QObject, Signal
 
 class AudioPlayer(QObject):
-    """
-    Manages audio playback using Pygame, but as a QObject
-    to send signals to a PySide6 GUI.
-    """
-    # --- Signals ---
-    current_song_changed = Signal(object) # object can be Song or None
-    queue_changed = Signal(list) # Emits the new queue list
+    # Signals
+    current_song_changed = Signal(object) 
+    queue_changed = Signal(list)
+    playback_state_changed = Signal(bool)
 
     def __init__(self):
-        """
-        Initialize the pygame mixer and the queue.
-        """
-        super().__init__() # Initialize as a QObject
-        
+        super().__init__()
         try:
-            pygame.mixer.init()
-            print("AudioPlayer initialized with Pygame.")
+            pygame.mixer.init(frequency=44100) 
         except Exception as e:
             print(f"Error initializing Pygame mixer: {e}")
             
         self.queue = []
         self.history = []
         self.current_song = None
-        self.is_playing = False
-            
+        self.is_playing = False 
+        self.is_paused = False
+        self.current_pos_offset = 0.0 
+        
+        self.SONG_END = pygame.USEREVENT + 1
+        pygame.mixer.music.set_endevent(self.SONG_END)
+
     def play_now(self, song):
-        """
-        Clears the queue, adds this song, and plays it immediately.
-        """
-        pygame.mixer.music.stop()
+        """Clears queue and plays a single song immediately."""
+        self.stop()
         self.queue = []
         self.queue.append(song)
         self.play_next_from_queue()
-        self.queue_changed.emit(self.queue) # Emit signal
-        
-    def add_to_queue(self, song):
+        self.queue_changed.emit(self.queue)
+
+    def play_list(self, songs, start_index=0):
         """
-        Adds a song to the end of the queue.
-        If the player is idle, it will start playing.
+        Clears queue, adds a LIST of songs, and plays from start_index.
+        This is used for "Play Album".
         """
-        self.queue.append(song)
-        print(f"✅ Added '{song.title}' to queue.")
-        self.queue_changed.emit(self.queue) # Emit signal
+        self.stop()
+        self.queue = list(songs) # Make a copy
         
-        # --- THIS IS THE NEW LOGIC ---
-        # If nothing is playing, start the queue.
-        if not self.is_playing and not pygame.mixer.music.get_busy():
-            print("Player is idle, starting queue playback...")
+        # If start_index is > 0, we need to pop the first few
+        # But usually for "Play Album", we start at 0.
+        # If we want to play track 1 immediately:
+        if self.queue:
             self.play_next_from_queue()
-        # --- END OF NEW LOGIC ---
+            
+        self.queue_changed.emit(self.queue)
+
+    def add_to_queue(self, song):
+        self.queue.append(song)
+        self.queue_changed.emit(self.queue)
+        if not self.is_playing and not self.is_paused:
+            self.play_next_from_queue()
+
+    def shuffle_queue(self):
+        """Shuffles the current queue."""
+        random.shuffle(self.queue)
+        self.queue_changed.emit(self.queue)
 
     def check_music_status(self):
-        """
-        This function is called by the QTimer in gui_main.py.
-        It checks if a song has finished and triggers the next one.
-        """
-        # If our flag says we're playing, but pygame says we're not...
-        if self.is_playing and not pygame.mixer.music.get_busy():
-            # The song just finished!
-            print("Song finished, playing next...")
-            self.is_playing = False
-            # Move finished song to history
-            if self.current_song:
-                self.history.append(self.current_song)
-            self.current_song = None
-            
-            # Emit signal to clear "Now Playing" text
-            self.current_song_changed.emit(None)
-            
-            # Immediately try to play the next song
-            self.play_next_from_queue()
+        for event in pygame.event.get():
+            if event.type == self.SONG_END:
+                print("Song finished.")
+                self.is_playing = False
+                self.is_paused = False
+                if self.current_song:
+                    self.history.append(self.current_song)
+                self.current_song = None
+                self.current_song_changed.emit(None)
+                self.play_next_from_queue()
 
     def play_next_from_queue(self):
-        """
-        Plays the next song in the queue IF nothing is already playing.
-        """
-        # 1. If music is already playing, do nothing.
-        if self.is_playing and pygame.mixer.music.get_busy():
-            return
+        if self.is_playing: return
+        if len(self.queue) == 0: return
 
-        # 2. If queue is empty, do nothing.
-        if len(self.queue) == 0:
-            return
-
-        # 3. If we are here, music is not playing and queue has songs.
-        #    Pop the next song and play it.
         song = self.queue.pop(0)
         self.current_song = song
         
         try:
             pygame.mixer.music.load(song.filepath)
+            self.current_pos_offset = 0.0
             pygame.mixer.music.play()
-            song.play() # This increments the play count
-            self.is_playing = True # Set our flag
-            print(f"▶️ Now playing: {self.current_song.title}")
-            # --- Emit Signals ---
+            song.play()
+            self.is_playing = True
+            self.is_paused = False
+            
             self.current_song_changed.emit(self.current_song)
             self.queue_changed.emit(self.queue)
+            self.playback_state_changed.emit(True)
         except Exception as e:
-            print(f"❌ Error playing file {song.filepath}: {e}")
+            print(f"Error: {e}")
             self.is_playing = False
-            
-    def skip_to_next(self):
-        """
-        Stops the current song and immediately plays the next one in the queue.
-        """
-        print("⏭️ Skipping to next song...")
-        pygame.mixer.music.stop()
-        
-        # Manually add the skipped song to history
+
+    def toggle_playback(self):
+        if not self.current_song: return
+        if self.is_paused:
+            pygame.mixer.music.unpause()
+            self.is_paused = False
+            self.is_playing = True
+            self.playback_state_changed.emit(True)
+        elif self.is_playing:
+            pygame.mixer.music.pause()
+            self.is_paused = True
+            self.is_playing = False
+            self.playback_state_changed.emit(False)
+
+    def seek(self, seconds):
         if self.current_song:
-            self.history.append(self.current_song)
+            try:
+                pygame.mixer.music.play(start=seconds)
+                self.current_pos_offset = seconds
+                self.is_playing = True
+                self.is_paused = False
+                self.playback_state_changed.emit(True)
+            except Exception as e:
+                print(f"Seek error: {e}")
+
+    def get_current_position(self):
+        if not self.current_song: return 0
+        pygame_pos_seconds = pygame.mixer.music.get_pos() / 1000.0
+        if pygame_pos_seconds < 0: return self.current_pos_offset
+        return self.current_pos_offset + pygame_pos_seconds
+
+    def skip_to_next(self):
+        self.stop()
+        if self.current_song: self.history.append(self.current_song)
         self.current_song = None
-        
-        self.is_playing = False
-        self.play_next_from_queue() # This will now just play the next item
+        self.play_next_from_queue()
 
     def play_previous_song(self):
-        """
-        Stops the current song, moves it back to the queue,
-        and plays the *last* song from the history.
-        """
-        if len(self.history) == 0:
-            print("❌ No previous song in history.")
-            return
-            
-        print("⏮️ Playing previous song...")
-        pygame.mixer.music.stop()
-        
-        # Put the current song back at the front of the queue
-        if self.current_song:
-            self.queue.insert(0, self.current_song)
+        if len(self.history) == 0: return
+        self.stop()
+        if self.current_song: self.queue.insert(0, self.current_song)
         self.current_song = None
-            
         prev_song = self.history.pop()
         self.queue.insert(0, prev_song)
-        
-        self.is_playing = False
         self.play_next_from_queue()
 
     def stop(self):
-        """
-        Stops the music and clears the entire queue and history.
-        """
-        self.queue = []
-        self.history = []
-        self.current_song = None
         pygame.mixer.music.stop()
         self.is_playing = False
-        print("⏹️ Music stopped and queue/history cleared.")
-        # --- Emit Signals ---
-        self.current_song_changed.emit(None)
-        self.queue_changed.emit(self.queue)
+        self.is_paused = False
+        self.current_pos_offset = 0.0
+        self.playback_state_changed.emit(False)
